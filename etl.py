@@ -257,7 +257,7 @@ def transform(raw: pd.DataFrame, code: str) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # LOAD
 # --------------------------------------------------------------------------- #
-# Table DDL only — indexes are created AFTER column migration in init_db()
+# Table DDL only: indexes are created AFTER column migration in init_db()
 TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS matches (
     match_id TEXT PRIMARY KEY,
@@ -288,12 +288,23 @@ CREATE TABLE IF NOT EXISTS etl_runs (
 );
 """
 
-# Indexes referencing matches columns — run only after migration ensures columns exist
+# Indexes reference matches columns, so they run only after the migration made sure those exist
 INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(match_date);
 CREATE INDEX IF NOT EXISTS idx_matches_home ON matches(home_team);
 CREATE INDEX IF NOT EXISTS idx_matches_away ON matches(away_team);
 """
+
+# Columns that may be missing in a database created by an older version of this script
+MIGRATABLE_COLUMNS = {
+    "match_date": "TEXT NOT NULL DEFAULT ''", "home_team": "TEXT NOT NULL DEFAULT ''",
+    "away_team": "TEXT NOT NULL DEFAULT ''", "home_goals": "INTEGER", "away_goals": "INTEGER", "result": "TEXT",
+    "home_shots": "INTEGER", "away_shots": "INTEGER", "home_shots_on_target": "INTEGER",
+    "away_shots_on_target": "INTEGER", "home_fouls": "INTEGER", "away_fouls": "INTEGER",
+    "home_corners": "INTEGER", "away_corners": "INTEGER", "home_yellows": "INTEGER", "away_yellows": "INTEGER",
+    "home_reds": "INTEGER", "away_reds": "INTEGER", "odds_home": "REAL", "odds_draw": "REAL",
+    "odds_away": "REAL", "updated_at": "TEXT NOT NULL DEFAULT ''",
+}
 
 
 def _py(value):
@@ -303,59 +314,33 @@ def _py(value):
     return value.item() if hasattr(value, "item") else value
 
 
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def init_db(conn: sqlite3.Connection, db_path: Path | None = None) -> sqlite3.Connection:
-    """Initialise (or migrate) the database. Returns the connection to use
-    (may be a brand-new connection if the old DB was wiped due to incompatible schema)."""
-    # Step 1: create tables (no indexes yet — they may reference columns not yet added)
+    """Create or upgrade the schema. NEVER deletes data.
+
+    If an old `matches` table has no match_id primary key (SQLite cannot add one afterwards),
+    it is RENAMED to matches_backup_<timestamp> and a fresh table is created. Every other
+    table in the file (fpl_players, fpl_snapshots, ...) is left untouched."""
     conn.executescript(TABLE_SQL)
 
-    # Step 2: sanity-check that the PRIMARY KEY column exists.
-    # ALTER TABLE cannot add a PRIMARY KEY, so if match_id is missing the DB schema
-    # is fundamentally incompatible and must be recreated from scratch.
-    pk_cols = {row[1] for row in conn.execute("PRAGMA table_info(matches)")}
-    if "match_id" not in pk_cols:
-        log.warning(
-            "DB schema is incompatible (missing PRIMARY KEY 'match_id'). "
-            "Wiping %s and starting fresh — all data will be re-downloaded.", db_path
-        )
-        conn.close()
-        if db_path and db_path.exists():
-            db_path.unlink()
-        conn = sqlite3.connect(db_path)
+    if "match_id" not in _columns(conn, "matches"):
+        backup = f"matches_backup_{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
+        log.warning("Old 'matches' table has no match_id key. Keeping it as '%s' and creating a fresh table; "
+                    "re-run the ETL to refill it.", backup)
+        with conn:
+            for idx in ("idx_matches_date", "idx_matches_home", "idx_matches_away"):
+                conn.execute(f"DROP INDEX IF EXISTS {idx}")      # index names must be free for the new table
+            conn.execute(f"ALTER TABLE matches RENAME TO {backup}")
         conn.executescript(TABLE_SQL)
 
-    # Step 3: migrate — add any additive columns missing from the existing table
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(matches)")}
-    schema_cols = {
-        "match_date": "TEXT NOT NULL DEFAULT ''",
-        "home_team": "TEXT NOT NULL DEFAULT ''",
-        "away_team": "TEXT NOT NULL DEFAULT ''",
-        "home_goals": "INTEGER",
-        "away_goals": "INTEGER",
-        "result": "TEXT",
-        "home_shots": "INTEGER",
-        "away_shots": "INTEGER",
-        "home_shots_on_target": "INTEGER",
-        "away_shots_on_target": "INTEGER",
-        "home_fouls": "INTEGER",
-        "away_fouls": "INTEGER",
-        "home_corners": "INTEGER",
-        "away_corners": "INTEGER",
-        "home_yellows": "INTEGER",
-        "away_yellows": "INTEGER",
-        "home_reds": "INTEGER",
-        "away_reds": "INTEGER",
-        "odds_home": "REAL",
-        "odds_draw": "REAL",
-        "odds_away": "REAL",
-        "updated_at": "TEXT NOT NULL DEFAULT ''",
-    }
-    for col, col_def in schema_cols.items():
+    existing = _columns(conn, "matches")
+    for col, definition in MIGRATABLE_COLUMNS.items():
         if col not in existing:
             log.info("DB migration: adding missing column '%s' to matches", col)
-            conn.execute(f"ALTER TABLE matches ADD COLUMN {col} {col_def}")
-
-    # Step 4: now that all columns exist, create indexes safely
+            conn.execute(f"ALTER TABLE matches ADD COLUMN {col} {definition}")
     conn.executescript(INDEX_SQL)
     return conn
 
